@@ -1,8 +1,8 @@
 // Supabase Auth モジュール — すべての非同期処理にタイムアウトを設定
+import { getPublicConfig } from "./services/configService.js";
 
 let _client = null;
 let _initFailed = false;
-let _configCache = null;
 
 function withTimeout(promise, ms, fallback = null) {
   return Promise.race([
@@ -11,21 +11,12 @@ function withTimeout(promise, ms, fallback = null) {
   ]);
 }
 
-async function fetchConfig() {
-  if (_configCache) return _configCache;
-  _configCache = withTimeout(
-    fetch("/api/config").then(r => r.json()),
-    4000,
-    { supabaseUrl: "", supabaseAnonKey: "" }
-  ).catch(() => ({ supabaseUrl: "", supabaseAnonKey: "" }));
-  return _configCache;
-}
 
 async function getClient() {
   if (_client) return _client;
   if (_initFailed) return null;
   try {
-    const config = await fetchConfig();
+    const config = await getPublicConfig();
     if (!config.supabaseUrl || !config.supabaseAnonKey) {
       _initFailed = true;
       return null;
@@ -51,6 +42,11 @@ async function getClient() {
 }
 
 export async function initAuth() {
+  // No account SDK/network is needed for a first-time public/guest visitor.
+  let hasSession = false;
+  try { hasSession = !!localStorage.getItem("dialogos.sb.auth"); } catch {}
+  const authReturn = /(?:[?#&])(?:code|access_token|error_description)=/.test(window.location.search + window.location.hash);
+  if (!hasSession && !authReturn) return null;
   return withTimeout(getClient(), 7000);
 }
 
@@ -101,7 +97,7 @@ export async function signOut() {
 }
 
 export async function onAuthStateChange(callback) {
-  const client = await getClient();
+  const client = _client;
   if (!client) return;
   return client.auth.onAuthStateChange(callback);
 }

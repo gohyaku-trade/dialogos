@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#241b0e"/><stop offset="1" stop-color="#0e0b08"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#967026" stop-opacity=".21"/><stop offset="1" stop-color="#967026" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <ellipse cx="960" cy="290" rx="310" ry="290" fill="url(#glow)"/>
+  <rect x="24" y="24" width="1152" height="582" rx="4" fill="none" stroke="#99752e" stroke-width="1"/>
+  <path d="M48 83V48H83M1117 48h35v35M48 547v35h35M1117 582h35v-35" fill="none" stroke="#d7ad50" stroke-width="2"/>
+  <text x="78" y="104" font-family="Georgia, serif" font-size="38" letter-spacing="5" fill="#dfb94f">DIALOGOS</text>
+  <text x="80" y="142" font-family="Meiryo, sans-serif" font-size="17" letter-spacing="4" fill="#b8a581">PHILOSOPHY · 14 VOICES</text>
+  <g fill="none" stroke="#c79b40" transform="translate(989 265)">
+    <circle r="101" opacity=".6"/>
+    <circle r="69" opacity=".16"/>
+    <path d="M0 -83L72 42H-72Z M72 -42L0 83L-72 -42Z" stroke-width="2" opacity=".8"/>
+    <circle r="6" fill="#d6af50" stroke="none"/>
+  </g>
+  <text x="76" y="268" font-family="Yu Mincho, Meiryo, serif" font-size="65" font-weight="600" fill="#f3e5c7">14人の賢者と、</text>
+  <text x="76" y="364" font-family="Yu Mincho, Meiryo, serif" font-size="65" font-weight="600" fill="#f3e5c7">あなたの問いを。</text>
+  <path d="M80 412H1120" stroke="#816127"/>
+  <text x="80" y="472" font-family="Meiryo, sans-serif" font-size="27" fill="#dabb74">ログイン不要で試せる、哲学対話。</text>
+  <text x="80" y="527" font-family="Meiryo, sans-serif" font-size="27" fill="#f3e5c7">気に入った人格は、無料であなたのChatGPTへ。</text>
+  <text x="1118" y="565" text-anchor="end" font-family="Meiryo, sans-serif" font-size="15" fill="#ad9b77">歴史上の思想に着想を得たAI</text>
+</svg>

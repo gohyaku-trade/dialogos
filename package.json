@@ -1,17 +1,25 @@
 {
   "name": "dialogos-sages",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Dialogos production app",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
+    "images:optimize": "node scripts/optimize-images.js",
+    "build": "node scripts/build-public.js",
+    "test": "node --test",
+    "eval:personas": "node scripts/persona-eval.mjs",
     "check": "node --check server.js && node --check api/index.js && node --check js/app.js && node --check js/data/philosophers.js && node --check js/data/prompts.js && node --check js/data/personalityFilters.js && node --check js/services/apiService.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "stripe": "^22.1.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
+    "sharp": "0.35.4"
   }
 }

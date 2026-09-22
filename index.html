@@ -3,7 +3,18 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="14人の賢者を、あなたのChatGPTへ。人格プロンプトをログイン不要・無料で持ち帰れる哲学対話アプリ Dialogos。">
     <title>賢者たちとの対話 — Dialogos</title>
+    <!-- share:begin -->
+    <meta property="og:type" content="website">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="og:site_name" content="Dialogos">
+    <meta property="og:title" content="Dialogos — 14人の賢者と、あなたの問いを。">
+    <meta property="og:description" content="Googleログイン不要で哲学対話を試せます。無料枠は全14人で1日合計3往復、日本時間0時更新。人格は試す前でも無料・無制限で持ち帰れます。受付には利用確認・予算上限があります。">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:title" content="Dialogos — 14人の賢者と、あなたの問いを。">
+    <meta name="twitter:description" content="Googleログイン不要で哲学対話を試せます。無料枠は全14人で1日合計3往復、日本時間0時更新。人格は試す前でも無料・無制限で持ち帰れます。受付には利用確認・予算上限があります。">
+    <!-- share:end -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=IM+Fell+English:ital@0;1&family=Noto+Serif+JP:wght@300;400;600&display=swap" rel="stylesheet">
@@ -36,9 +47,7 @@
         <nav class="nav-actions" aria-label="メニュー">
           <button data-route="list">賢者一覧</button>
           <button data-route="history">履歴</button>
-          <button data-route="subscription" class="nav-sub-btn" id="subNavBtn">記憶の書</button>
-          <button data-route="purchase" class="nav-purchase-btn">灯火を継ぐ</button>
-          <span class="meter" id="usageMeter" title="灯火の残量" hidden>
+          <span class="meter" id="usageMeter" title="今日の無料対話の残り回数" hidden>
             <span class="meter-inner"></span>
           </span>
           <div id="authNav" class="auth-nav"></div>
@@ -48,19 +57,13 @@
     </div>
     <div class="ornament-strip" aria-hidden="true"></div>
 
-    <!-- 決済成功バナー（JS で表示制御） -->
-    <div id="successBanner" class="success-banner" hidden>
-      <span>✦</span>
-      <p>灯火を受け取りました。賢者との対話を続けてください。</p>
-      <button id="successBannerClose" aria-label="閉じる">✕</button>
-    </div>
     <footer class="legal-footer">
       <div class="legal-footer-inner">
         <a href="./terms.html">利用規約</a>
         <a href="./privacy.html">プライバシーポリシー</a>
-        <a href="./legal.html">特定商取引法</a>
+        <a href="./legal.html">サービス・運営情報</a>
       </div>
-      <p>Dialogos · 賢者たちとの対話</p>
+      <p>Dialogos · 賢者たちとの対話<br>歴史上の思想に着想を得たAIによる対話です。本人の発言や正確な引用を保証するものではありません。</p>
     </footer>
 
     <!-- アプリ内ブラウザ警告オーバーレイ -->
@@ -79,7 +82,7 @@
         </div>
         <button class="inapp-copy-btn" id="inappCopyBtn">URLをコピーする</button>
         <p class="inapp-copy-result" id="inappCopyResult"></p>
-        <button class="inapp-close-btn" id="inappCloseBtn">このまま続ける（ログインなし）</button>
+        <button class="inapp-close-btn" id="inappCloseBtn">人格を無料で持ち帰る（ログインなし）</button>
       </div>
     </div>
 

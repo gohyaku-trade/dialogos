@@ -1,32 +1,21 @@
 import { getAccessToken } from "../auth.js";
+import { getPublicConfig } from "./configService.js";
 
-const GUEST_KEY = "dialogos.guestId";
-
-function getGuestId() {
-  let id = localStorage.getItem(GUEST_KEY);
-  if (!id) {
-    const seed = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : `${Date.now()}${Math.random().toString(16).slice(2)}`;
-    id = `guest_${seed}`;
-    localStorage.setItem(GUEST_KEY, id);
+async function request(path, { anonymous = false, ...options } = {}) {
+  const token = anonymous ? null : await getAccessToken();
+  if (!anonymous && !token) {
+    const error = new Error("Googleでログインしてください。");
+    error.code = "AUTH_REQUIRED";
+    error.status = 401;
+    throw error;
   }
-  document.cookie = `dialogos_guest_id=${encodeURIComponent(id)}; Max-Age=31536000; Path=/; SameSite=Lax`;
-  return id;
-}
-
-async function request(path, options = {}) {
-  const token = await getAccessToken();
-  const guestId = getGuestId();
-
-  // JWTがある場合はAuthorizationヘッダーで送信（X-Guest-Idも同時送信して匿名データを統合）
-  const authHeaders = token
-    ? { "Authorization": `Bearer ${token}`, "X-Guest-Id": guestId }
-    : { "X-Guest-Id": guestId };
 
   const response = await fetch(path, {
+    credentials: "same-origin",
     ...options,
     headers: {
       "Content-Type": "application/json",
-      ...authHeaders,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {}),
     },
   });
@@ -34,6 +23,7 @@ async function request(path, options = {}) {
   if (!response.ok) {
     const error = new Error(data.message || "REQUEST_FAILED");
     error.code = data.code;
+    error.status = response.status;
     error.data = data;
     throw error;
   }
@@ -41,7 +31,19 @@ async function request(path, options = {}) {
 }
 
 export const apiService = {
-  getGuestId,
+  getConfig() {
+    return getPublicConfig();
+  },
+  getGuestMe() {
+    return request("/api/guest/me", { anonymous: true });
+  },
+  startGuestSession(turnstileToken) {
+    return request("/api/guest/session", { anonymous: true, method: "POST", body: JSON.stringify({ turnstileToken }) });
+  },
+  sendGuestChat({ philosopherId, message, conversationId, requestId, expectChargeSource, turnstileToken }) {
+    return request("/api/guest/chat", { anonymous: true, method: "POST",
+      body: JSON.stringify({ philosopherId, message, conversationId, requestId, expectChargeSource, turnstileToken }) });
+  },
   getMe() {
     return request("/api/me");
   },
@@ -51,34 +53,38 @@ export const apiService = {
       body: JSON.stringify({ displayName }),
     });
   },
-  getHistory() {
-    return request("/api/history");
+  async getHistory() {
+    const data = await request("/api/history");
+    return Array.isArray(data) ? data : data.conversations || [];
   },
   getMemories() {
     return request("/api/memories");
   },
   getPackages() {
-    return request("/api/packages");
+    return request("/api/packages", { anonymous: true });
   },
-  sendChat({ philosopherId, message, conversationId }) {
+  sendChat({ philosopherId, message, conversationId, requestId, expectChargeSource }) {
     return request("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ philosopherId, message, conversationId }),
+      body: JSON.stringify({ philosopherId, message, conversationId, requestId, expectChargeSource }),
     });
   },
-  createCheckout(packageId) {
+  createCheckout(packageId, requestId) {
     return request("/api/stripe/checkout", {
       method: "POST",
-      body: JSON.stringify({ packageId }),
+      body: JSON.stringify({ packageId, requestId }),
     });
   },
 
   getConversationMessages(conversationId) {
-    return request(`/api/history/${conversationId}/messages`);
+    return request(`/api/history/${encodeURIComponent(conversationId)}/messages`);
   },
 
-  getSubscription() {
-    return request("/api/subscription");
+  async getSubscription() {
+    const data = await request("/api/subscription");
+    return { ...data, status: data.status ?? data.subscription_status,
+      currentPeriodEnd: data.currentPeriodEnd ?? data.current_period_end,
+      cancelAtPeriodEnd: data.cancelAtPeriodEnd ?? data.cancel_at_period_end };
   },
 
   createPortal() {
@@ -96,21 +102,4 @@ export const apiService = {
     });
   },
 
-  restoreSubscription() {
-    return request("/api/me/restore-subscription", { method: "POST" });
-  },
-
-  restoreByEmail(email) {
-    return request("/api/me/restore-by-email", {
-      method: "POST",
-      body: JSON.stringify({ email }),
-    });
-  },
-
-  cancelByEmail(email) {
-    return request("/api/stripe/cancel-by-email", {
-      method: "POST",
-      body: JSON.stringify({ email }),
-    });
-  },
 };

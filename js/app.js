@@ -1,6 +1,9 @@
 import { philosophers, getPhilosopherById } from "./data/philosophers.js";
 import { apiService } from "./services/apiService.js";
-import { initAuth, getAuthUser, signInWithGoogle, signOut, onAuthStateChange } from "./auth.js";
+import { initAuth, signInWithGoogle, signOut, onAuthStateChange } from "./auth.js";
+import { openTakeawayDialog } from "./ui/takeawayDialog.js";
+import { requestTurnstileToken, cancelTurnstile } from "./services/turnstileService.js";
+import { buildShareUrl, buildXIntent, parseSharedSage } from "./services/shareService.js";
 
 // ── 状態 ──────────────────────────────────────────────────────────────────────
 const app        = document.querySelector("#app");
@@ -8,6 +11,9 @@ const usageMeter = document.querySelector("#usageMeter");
 
 // LINEなどのアプリ内ブラウザはChrome/SafariとlocalStorageを共有しないためGoogleログイン不可
 const IN_APP_BROWSER = isInAppBrowser();
+const MAX_MESSAGE_CHARS = 1000;
+const PENDING_CHAT_KEY = "dialogos.v3.pendingChat";
+const PUBLIC_ROUTES = ["list", "chat", "profile", "history"];
 
 const state = {
   route: "list",
@@ -16,7 +22,18 @@ const state = {
   user: null,
   history: [],
   loading: false,
-  packages: [],
+  activeRequestId: null,
+  trial: { enabled: false },
+  configLoaded: false,
+  anonymousEnabled: false,
+  turnstileSiteKey: "",
+  guestStarting: false,
+  identityEpoch: 0,
+  identityRefresh: 0,
+  visibleMessages: [],
+  trialRefreshTimer: null,
+  pendingChat: null,
+  messagesLoading: false,
 };
 
 boot();
@@ -36,7 +53,7 @@ function showInAppWarning() {
   if (overlay) overlay.style.display = "flex";
 
   document.getElementById("inappCopyBtn")?.addEventListener("click", () => {
-    const url = location.href;
+    const url = buildShareUrl({ canonicalUrl: publicCanonical(), philosopherId: state.philosopherId }) || window.location.origin + "/";
     const result = document.getElementById("inappCopyResult");
     if (navigator.clipboard) {
       navigator.clipboard.writeText(url).then(() => {
@@ -57,81 +74,128 @@ function showInAppWarning() {
 
 // ── ブート ─────────────────────────────────────────────────────────────────────
 async function boot() {
-  if (isInAppBrowser()) showInAppWarning();
-  bindEvents();
-
-  // セッションが localStorage にある場合はauth初期化を先に待つ
-  // （リターンユーザーのゲスト状態ちらつきを防ぐ。CDNキャッシュ済みなら 100〜300ms で完了）
-  // タイムアウト上限を設けて低速回線でも起動が止まらないようにする
-  let hasStoredSession = false;
-  try { hasStoredSession = !!localStorage.getItem("dialogos.sb.auth"); } catch {}
-
-  const packagesPromise = loadPackages();
-
-  if (hasStoredSession) {
-    await Promise.race([
-      initAuth(),
-      new Promise(r => setTimeout(r, 2000)), // 2秒でタイムアウト（低速回線の保険）
-    ]);
+  // Copying a persona needs no login, including inside social-app browsers.
+  const entryParams = new URLSearchParams(window.location.search);
+  const sharedSage = parseSharedSage(window.location.search);
+  if (sharedSage && !entryParams.has("checkout") && !entryParams.has("payment") &&
+    !["purchase", "subscription", "cancel"].includes(entryParams.get("route"))) {
+    state.philosopherId = sharedSage;
+    state.route = "chat";
   }
-
-  await Promise.all([refreshUser(), packagesPromise]);
+  bindEvents();
   renderAuthNav();
-
-  // auth状態変化の永続リスナー（ログイン・ログアウト・トークン更新に対応）
-  initAuth()
-    .then(() => onAuthStateChange(async (event, session) => {
-      if (
-        event === "SIGNED_IN" ||
-        event === "TOKEN_REFRESHED" ||
-        (event === "INITIAL_SESSION" && session)
-      ) {
-        await refreshUser();
-        renderAuthNav();
-        if (state.route !== "chat") render();
-      } else if (event === "SIGNED_OUT") {
-        await refreshUser();
-        renderAuthNav();
-        if (state.route !== "chat") render();
-      }
-    }))
-    .catch(() => {});
+  render();
+  const configPromise = loadConfig().then(() => {
+    updateUsageMeter();
+    if (state.route !== "chat" || !hasReplyIdentity()) render();
+    else updateChatAccess();
+  });
+  await initAuth();
+  await refreshUser();
+  renderAuthNav();
+  // Auth callbacks must return before requesting another session from the SDK.
+  onAuthStateChange((event) => {
+    if (!["SIGNED_IN", "TOKEN_REFRESHED", "INITIAL_SESSION", "SIGNED_OUT"].includes(event)) return;
+    setTimeout(async () => {
+      const previousUserId = state.user?.id;
+      await refreshUser({ account: true });
+      renderAuthNav();
+      if (event === "SIGNED_OUT" || previousUserId !== state.user?.id || state.route !== "chat") render();
+    }, 0);
+  }).catch(() => {});
+  await configPromise;
 
   const params = new URLSearchParams(window.location.search);
-  if (params.get("payment") === "success") {
-    const sessionId = params.get("session_id") || sessionStorage.getItem("dialogos.pendingSession");
-    sessionStorage.removeItem("dialogos.pendingSession");
+  // Old payment links no longer enter a sales screen or synchronize a purchase.
+  try { sessionStorage.removeItem("dialogos.pendingSession"); } catch {}
+  const legacyEntry = params.has("checkout") || params.has("payment") ||
+    ["purchase", "subscription", "cancel"].includes(params.get("route"));
+  if (legacyEntry) {
+    state.route = "list";
+    state.conversationId = null;
     history.replaceState({}, "", window.location.pathname);
-    if (sessionId) {
-      try {
-        const user = await apiService.syncSession(sessionId);
-        state.user = user;
-        updateUsageMeter();
-      } catch (_) {
-        // webhookが先に処理済みの場合など。通常のrefreshにフォールバック
+  } else if (sharedSage) {
+    state.route = "chat";
+    state.philosopherId = sharedSage;
+    state.conversationId = null;
+    history.replaceState({}, "", window.location.pathname + "?sage=" + encodeURIComponent(sharedSage));
+  } else if (params.has("route")) {
+    state.route = PUBLIC_ROUTES.includes(params.get("route")) ? params.get("route") : "list";
+    history.replaceState({}, "", window.location.pathname);
+  } else if (state.user?.logged_in) {
+    try {
+      const returnTo = JSON.parse(sessionStorage.getItem("dialogos.v3.returnTo") || "null");
+      sessionStorage.removeItem("dialogos.v3.returnTo");
+      if (returnTo && PUBLIC_ROUTES.includes(returnTo.route)) {
+        state.route = returnTo.route;
+        if (philosophers.some(sage => sage.id === returnTo.philosopherId)) state.philosopherId = returnTo.philosopherId;
+        state.conversationId = returnTo.conversationId || null;
       }
-    }
-    await refreshUser();
-    showSuccessBanner();
-  } else if (params.get("route")) {
-    state.route = params.get("route");
-    history.replaceState({}, "", window.location.pathname);
+    } catch {}
   }
 
   render();
 }
 
-async function loadPackages() {
+async function loadConfig() {
   try {
-    state.packages = await apiService.getPackages();
+    const { trial, anonymousEnabled, turnstileSiteKey } = await apiService.getConfig();
+    state.trial = { enabled: trial?.enabled === true && trial.allPhilosophers === true &&
+      trial.dailyReplies === 3 && trial.resetTimezone === "Asia/Tokyo" && trial.requiresGoogle === false };
+    state.turnstileSiteKey = typeof turnstileSiteKey === "string" ? turnstileSiteKey.trim() : "";
+    state.anonymousEnabled = anonymousEnabled === true && !!state.turnstileSiteKey && state.trial.enabled;
   } catch {
-    state.packages = [];
+    state.trial = { enabled: false };
+    state.anonymousEnabled = false;
+  } finally {
+    state.configLoaded = true;
   }
+}
+
+function trialRemaining() {
+  if (!hasReplyIdentity() || state.user.trial_eligible !== true) return 0;
+  return Math.max(0, Math.min(3, Math.floor(Number(state.user.trial_remaining) || 0)));
+}
+
+function canUseTrial(philosopherId = state.philosopherId) {
+  return state.trial.enabled && (!state.user?.is_guest || state.anonymousEnabled) && philosophers.some(sage => sage.id === philosopherId) && trialRemaining() > 0;
+}
+
+function hasReplyIdentity() { return !!(state.user?.logged_in || state.user?.is_guest); }
+function identityKey(user = state.user) { return user?.id ? `${user.is_guest ? "guest" : "account"}:${user.id}` : ""; }
+
+function canStartReply(philosopherId = state.philosopherId) {
+  return canUseTrial(philosopherId);
+}
+
+function renderTrialOffer() {
+  if (!state.trial.enabled || (!state.user?.logged_in && !state.anonymousEnabled)) return `<p class="composer-note">${state.configLoaded ? "サイト内のお試し対話は現在休止中です。" : "サイト内のお試し対話の受付状況を確認中です。"}人格の持ち帰りは、いつでも無料で利用できます。</p>`;
+  const identified = hasReplyIdentity();
+  if (identified && state.user.trial_eligible !== true) {
+    return `<div class="trial-offer"><p>このアカウントでは無料対話を利用できません。人格はログイン状態にかかわらず無料で持ち帰れます。</p></div>`;
+  }
+  if (identified && trialRemaining() === 0) {
+    return `<div class="trial-offer trial-offer--complete"><p>${Number(state.user.trial_reserved) > 0 ? "無料対話の返答を確認中です。" : "今日の無料対話3往復は終了しました。日本時間0時に更新されます。"}</p><p>続きは人格を持ち帰り、ご自身のChatGPTでどうぞ。</p></div>`;
+  }
+  return `<div class="trial-offer"><p class="trial-title">好きな賢者と、${identified ? `今日は残り${trialRemaining()}往復` : "1日3往復"}を無料で。</p>
+    <p>全14人で合計3往復。あなたの問いと返答で1往復です。Googleログイン不要。このブラウザの無料枠は日本時間0時に更新。人格は試す前でも持ち帰れます。</p>
+    <p class="trial-note">対話の開始・生成時に不正利用対策の確認があります。同じ回線の利用状況や全体の予算上限で、3往復より前に受付を止める場合があります。厳密な「1人」の判定ではありません。</p></div>`;
 }
 
 // ── イベントバインド ──────────────────────────────────────────────────────────
 function bindEvents() {
   document.body.addEventListener("click", (e) => {
+    const takeaway = e.target.closest("[data-takeaway]");
+    if (takeaway) {
+      const philosopherId = takeaway.dataset.takeaway || state.philosopherId;
+      openTakeawayDialog({ philosopherId, source: takeaway.dataset.source || "card",
+        messages: state.route === "chat" && philosopherId === state.philosopherId ? state.visibleMessages : [] });
+      return;
+    }
+    if (e.target.closest("[data-login]")) { handleGoogleLogin(); return; }
+    const share = e.target.closest("[data-copy-share]");
+    if (share) { copyPublicLink(share); return; }
+    if (e.target.closest("[data-guest-start]")) { handleGuestStart(); return; }
     const route = e.target.closest("[data-route]");
     if (route) { navigate(route.dataset.route); return; }
 
@@ -148,17 +212,24 @@ function bindEvents() {
     }
     const topic = e.target.closest("[data-topic]");
     if (topic) {
+      if (state.loading || state.pendingChat) return;
       const input = document.querySelector("#messageInput");
       if (input) { input.value = topic.dataset.topic; input.focus(); }
     }
   });
 
-  document.getElementById("successBannerClose")?.addEventListener("click", hideSuccessBanner);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && hasReplyIdentity() && !state.loading) refreshVisibleUsage();
+  });
 }
 
 // ── ナビゲーション ─────────────────────────────────────────────────────────────
 function navigate(route, params = {}) {
-  state.route = route;
+  if (state.loading || state.guestStarting) return;
+  if (route === "chat" && state.pendingChat) {
+    params = { philosopherId: state.pendingChat.philosopherId, conversationId: state.pendingChat.conversationId };
+  }
+  state.route = PUBLIC_ROUTES.includes(route) ? route : "list";
   if (params.philosopherId) state.philosopherId = params.philosopherId;
   state.conversationId = params.conversationId || null;
   render();
@@ -166,21 +237,65 @@ function navigate(route, params = {}) {
 }
 
 // ── ユーザー更新 ──────────────────────────────────────────────────────────────
-async function refreshUser() {
+async function refreshUser({ account = false } = {}) {
+  const previousUserId = identityKey();
+  const refreshId = ++state.identityRefresh;
   try {
-    state.user = await apiService.getMe();
+    const nextUser = !account && state.user?.is_guest ? await apiService.getGuestMe() : await apiService.getMe();
+    if (refreshId !== state.identityRefresh) return;
+    if (previousUserId !== identityKey(nextUser)) invalidatePrivateView();
+    state.user = nextUser;
+    scheduleTrialRefresh();
+    restorePendingChat();
     usageMeter.hidden = false;
     updateUsageMeter();
-    updateSubNavBtn();
+    if (state.route === "chat") updateChatAccess();
+    if (previousUserId !== identityKey()) { renderAuthNav(); render(); }
   } catch {
+    if (refreshId !== state.identityRefresh) return;
+    clearTimeout(state.trialRefreshTimer);
+    if (previousUserId) invalidatePrivateView();
+    state.user = null;
+    state.pendingChat = null;
     usageMeter.hidden = true;
+    if (previousUserId) { renderAuthNav(); render(); }
   }
 }
 
-function updateSubNavBtn() {
-  const btn = document.getElementById("subNavBtn");
-  if (!btn) return;
-  btn.hidden = false;
+function invalidatePrivateView() {
+  state.identityEpoch++;
+  state.identityRefresh++;
+  cancelTurnstile();
+  const dialog = document.getElementById("takeawayDialog");
+  if (dialog?.open) dialog.close();
+  dialog?.remove();
+  state.visibleMessages = [];
+  state.history = [];
+  state.messagesLoading = false;
+  state.conversationId = null;
+  state.pendingChat = null;
+  state.activeRequestId = null;
+  state.loading = false;
+  state.guestStarting = false;
+}
+
+function scheduleTrialRefresh() {
+  clearTimeout(state.trialRefreshTimer);
+  const resetAt = Date.parse(state.user?.trial_resets_at || state.user?.trial_resetsAt || "");
+  if (!Number.isFinite(resetAt)) return;
+  // The clock schedules a server refresh; it never grants local free credits.
+  state.trialRefreshTimer = setTimeout(() => { if (hasReplyIdentity()) refreshVisibleUsage(); },
+    trialRefreshDelay(resetAt));
+}
+
+function trialRefreshDelay(resetAt, now = Date.now()) {
+  // A fast client clock or stale response must not create a one-second poll loop.
+  return resetAt <= now ? 300000 : Math.max(1000, Math.min(86401000, resetAt - now + 1000));
+}
+
+async function refreshVisibleUsage() {
+  await refreshUser();
+  if (state.route !== "chat") render();
 }
 
 // ── 認証ナビゲーション ────────────────────────────────────────────────────────
@@ -219,15 +334,20 @@ function renderAuthNav() {
       if (overlay) overlay.style.display = "flex";
     });
   } else {
-    el.innerHTML = `<button class="auth-login-btn" id="googleLoginBtn">Googleでログイン</button>`;
+    el.innerHTML = `<button class="auth-login-btn" id="googleLoginBtn">履歴にログイン</button>`;
     document.getElementById("googleLoginBtn")?.addEventListener("click", handleGoogleLogin);
   }
 }
 
 async function handleGoogleLogin() {
+  if (state.loading) return;
+  if (IN_APP_BROWSER) { showInAppWarning(); return; }
+  const returnTo = { route: state.route, philosopherId: state.philosopherId, conversationId: state.user?.is_guest ? null : state.conversationId };
+  invalidatePrivateView();
   const btn = document.getElementById("googleLoginBtn");
   if (btn) { btn.textContent = "移動中…"; btn.disabled = true; }
   try {
+    try { sessionStorage.setItem("dialogos.v3.returnTo", JSON.stringify(returnTo)); } catch {}
     await signInWithGoogle();
     // OAuthリダイレクト後はページが再ロードされるので、ここには戻らない
   } catch (err) {
@@ -238,40 +358,37 @@ async function handleGoogleLogin() {
 }
 
 async function handleLogout() {
+  if (state.loading) return;
   try {
     await signOut();
+    invalidatePrivateView();
     state.user = null;
+    state.pendingChat = null;
+      state.conversationId = null;
+    state.route = "list";
     updateUsageMeter();
     renderAuthNav();
-    await refreshUser(); // 匿名ユーザーとして再取得
     render();
   } catch (err) {
     console.error("[auth] logout failed:", err.message);
   }
 }
 
-const FLAME_SVG = `<svg class="flame-icon" viewBox="0 0 10 14" width="9" height="12" aria-hidden="true" fill="currentColor"><path d="M5 0s1.1 2.6 1.1 3.9c0 .85-.38 1.6-.88 2.05 0 0 .85-1.45-.28-3.05 0 0-.58 2.25-1.82 3.1C2.25 6.65 1.4 7.7 1.4 9.1c0 1.95 1.6 3.6 3.6 3.6s3.6-1.65 3.6-3.6C8.6 6.8 6.8 5.1 7 3.75c0 0-1.1 1.85-1.92 2.12C4.38 5.18 4.1 4.4 4.1 3.7 4.1 2 5 0 5 0z"/></svg>`;
-
 function updateUsageMeter() {
   const u = state.user;
-  if (!u) return;
+  usageMeter.hidden = !hasReplyIdentity() || !state.trial.enabled || u.trial_eligible !== true;
+  if (!hasReplyIdentity()) return;
   const inner = usageMeter.querySelector(".meter-inner");
-
-  const parts = [];
-  if (u.free_count > 0) {
-    parts.push(`<span class="meter-free">試問 <b>${u.free_count}</b>/10</span>`);
-  }
-  if (u.credits > 0) {
-    parts.push(`<span class="meter-credits">${FLAME_SVG}<b>${u.credits}</b></span>`);
-  }
-  if (!parts.length) {
-    parts.push(`<span class="meter-locked">灯火切れ</span>`);
-  }
-  inner.innerHTML = parts.join(`<span class="meter-sep">·</span>`);
+  inner.innerHTML = state.trial.enabled && u.trial_eligible === true ? `<span class="meter-trial">今日の無料 <b>${trialRemaining()}</b>/3</span>` : "";
+  const summary = document.querySelector(".usage-box");
+  if (summary) summary.textContent = usageSummaryText();
+  const note = document.getElementById("composerNote");
+  if (note) note.textContent = composerNoteText();
 }
 
 // ── メインレンダラー ──────────────────────────────────────────────────────────
 function render() {
+  if (state.route !== "chat") state.visibleMessages = [];
   const sage = getPhilosopherById(state.philosopherId);
   app.className = `view-root theme-${sage.theme} motif-${sage.motif}`;
   ({
@@ -279,84 +396,44 @@ function render() {
     profile:      renderProfile,
     chat:         renderChat,
     history:      renderHistory,
-    purchase:     renderPurchase,
-    subscription: renderSubscription,
-    cancel:       renderCancel,
   }[state.route] || renderList)();
 }
 
 // ── 賢者一覧 ──────────────────────────────────────────────────────────────────
-function isSubscriber() {
-  const u = state.user;
-  if (!u) return false;
-  const status = u.subscription_status;
-  const cancelAtEnd = u.subscription_cancel_at_period_end;
-  const periodEnd = u.subscription_current_period_end;
-
-  if (status === "active" || status === "trialing") {
-    if (cancelAtEnd && periodEnd && new Date(periodEnd) <= new Date()) return false;
-    return true;
-  }
-  // canceled でも period_end が未来なら有効（cancelAtEnd の値に依存しない）
-  if (status === "canceled" && periodEnd) {
-    return new Date(periodEnd) > new Date();
-  }
-  // unlocked_characters で解放済み（一括購入など）
-  if (u.unlocked_characters?.includes("all")) return true;
-  return false;
-}
-
 function renderList() {
-  const subscribed = isSubscriber();
-  const loggedIn = state.user?.logged_in;
   app.innerHTML = `
     <section class="hero-list">
       <p class="eyebrow">14人の哲学者・宗教家</p>
-      <h1>賢者を選ぶ</h1>
-      <p>あなたの答えが、本当の問いを隠している。</p>
-      ${subscribed
-        ? `<div class="hero-sub-badge">✦ 記憶の書加入中 — 全14賢者と対話可能</div>`
-        : !loggedIn && !IN_APP_BROWSER
-          ? `<p style="margin-top:10px;font-size:12px;color:rgba(245,234,214,0.4)">
-              別の端末で購入済みの方は
-              <button id="heroLoginBtn" style="background:none;border:none;color:rgba(212,168,67,0.7);cursor:pointer;font-size:12px;text-decoration:underline;padding:0">Googleでログイン</button>
-            </p>`
-          : ``}
+      <h1 class="takeaway-hero-title"><span>賢者を、あなたの</span><span>ChatGPTへ。</span></h1>
+      <p>人格を選んでコピー。新しいチャットに貼り付けるだけ。<br>全14人、ログイン不要・何度でも無料で持ち帰れます。</p>
+      <div class="hero-actions"><button class="primary-button" data-takeaway="socrates" data-source="hero">人格を無料で持ち帰る</button><a class="secondary-button" href="#sageGrid">賢者を選んで試す ↓</a></div>
+      ${renderShareActions()}
+      <p class="composer-note">歴史上の思想に着想を得た創作人格です。ChatGPT側の利用条件・回数制限が適用され、当サイトと同じ返答を保証するものではありません。</p>
+      ${renderTrialOffer()}
+      ${state.pendingChat ? `<p class="pending-notice">前の問いの返答を確認できます。<button class="secondary-button" data-chat="${escapeHtml(state.pendingChat.philosopherId)}">対話に戻る</button></p>` : ""}
+      <details class="dialogue-example"><summary>対話の雰囲気を読む</summary>
+        <p class="example-caption">AIによる思想シミュレーションの作例です。歴史上の本人の発言ではありません。</p>
+        <p><b>あなた</b>　人に認められないと、自分に価値がない気がします。</p>
+        <p><b>ソクラテス</b>　あなたをよく知らない人が褒めたときと、よく知る人が批判したとき。自分の価値を確かめる手がかりになるのは、どちらだろう。認められることと、正しく理解されることは、同じだろうか。</p>
+      </details>
     </section>
-    <section class="sage-grid">
+    <section class="sage-grid" id="sageGrid" aria-label="持ち帰る賢者を選ぶ">
       ${philosophers.map((sage, i) => renderSageCard(sage, i)).join("")}
     </section>
   `;
-  document.getElementById("heroLoginBtn")?.addEventListener("click", handleGoogleLogin);
 }
 
 function renderSageCard(sage, index = 0) {
-  const subscribed = isSubscriber();
-  const unlocked   = sage.free || subscribed;
-
-  let statusLabel, statusClass, actionBtn;
-
-  if (subscribed) {
-    statusLabel = "対話可能";
-    statusClass = "open";
-    actionBtn   = `<button class="card-chat-btn" data-chat="${sage.id}">対話する</button>`;
-  } else if (sage.free) {
-    statusLabel = "無料体験あり";
-    statusClass = "free";
-    actionBtn   = `<button class="card-chat-btn" data-chat="${sage.id}">対話する</button>`;
-  } else {
-    statusLabel = "記憶の書で解放";
-    statusClass = "locked";
-    actionBtn   = `<button class="card-chat-btn card-chat-btn--locked" data-route="purchase">記憶の書を開く</button>`;
-  }
+  const statusLabel = "人格コピー無料";
+  const actionBtn = `<button class="secondary-button" data-chat="${sage.id}">サイトで試す</button>`;
 
   return `
-    <article class="sage-card theme-${sage.theme} motif-${sage.motif}${!unlocked ? " sage-card--locked" : ""}"
+    <article class="sage-card theme-${sage.theme} motif-${sage.motif}"
              style="animation-delay:${(index * 0.06).toFixed(2)}s">
       <div class="portrait ${sage.allowPortrait ? "" : "symbolic"}"
            data-profile="${sage.id}" role="button" tabindex="0"
            aria-label="${escapeHtml(sage.name)}のプロフィールへ">
-        ${renderAvatar(sage, "card")}
+        ${renderAvatar(sage, "card", index === 0)}
         <div class="portrait-overlay" aria-hidden="true">
           <span class="portrait-overlay-label">詳しく見る</span>
         </div>
@@ -364,11 +441,12 @@ function renderSageCard(sage, index = 0) {
       <div class="sage-card-body">
         <div class="card-meta">
           <b>${sage.category}</b>
-          <em class="card-status card-status--${statusClass}">${statusLabel}</em>
+          <em class="card-status card-status--open">${statusLabel}</em>
         </div>
         <h2>${sage.name}</h2>
         <p class="card-catch">${sage.catch}</p>
         <p class="title">${sage.title}</p>
+        <button class="card-chat-btn takeaway-card-button" data-takeaway="${sage.id}" data-source="card">人格を無料で持ち帰る</button>
         <div class="card-actions">
           <button class="secondary-button" data-profile="${sage.id}">詳しく見る</button>
           ${actionBtn}
@@ -394,9 +472,10 @@ function renderProfile() {
         <p class="eyebrow">${sage.category} · ${sage.era}</p>
         <h1>${sage.name}</h1>
         <div class="profile-quick-action">
-          <button class="card-chat-btn profile-chat-btn" data-chat="${sage.id}">今すぐ対話する →</button>
+          <button class="card-chat-btn profile-chat-btn" data-takeaway="${sage.id}" data-source="card">人格を無料で持ち帰る</button>
         </div>
         <p class="lead">${sage.description}</p>
+        ${renderTrialOffer()}
 
         <div class="worry-section">
           <p class="worry-heading">こんな悩みを抱えている人へ</p>
@@ -409,16 +488,158 @@ function renderProfile() {
           <div><dt>思想の特徴</dt><dd>${sage.thought}</dd></div>
           <div><dt>この対話で起きること</dt><dd>${sage.catch}</dd></div>
         </dl>
-        <button class="primary-button" data-chat="${sage.id}">この賢者と対話する</button>
+        <button class="secondary-button" data-chat="${sage.id}">サイトでこの賢者を試す</button>
+        ${renderShareActions(sage.id)}
       </div>
     </section>
   `;
 }
 
+function publicCanonical() { return document.querySelector('link[rel="canonical"]')?.getAttribute?.("href") || ""; }
+
+function renderShareActions(philosopherId = null) {
+  const options = { canonicalUrl: publicCanonical(), philosopherId };
+  if (!buildShareUrl(options)) return "";
+  return `<div class="public-share"><div class="public-share-actions">
+    <button type="button" class="secondary-button" data-copy-share="${philosopherId || ""}">${philosopherId ? "この賢者の" : "サイトの"}リンクをコピー</button>
+    <a class="secondary-button" href="${escapeHtml(buildXIntent(options))}" target="_blank" rel="noopener noreferrer">Xで紹介する ↗</a>
+    </div><p class="composer-note">会話は共有されません。Xでは投稿内容を確認してから、ご自身で投稿できます。</p>
+    <input class="public-share-url" type="text" readonly hidden aria-label="共有用リンク"><p class="public-share-status" role="status"></p></div>`;
+}
+
+async function copyPublicLink(button) {
+  const url = buildShareUrl({ canonicalUrl: publicCanonical(), philosopherId: button.dataset.copyShare || null });
+  if (!url) return;
+  const block = button.closest(".public-share");
+  const status = block.querySelector(".public-share-status");
+  const field = block.querySelector(".public-share-url");
+  try {
+    if (!window.isSecureContext || !navigator.clipboard?.writeText) throw new Error("MANUAL_COPY");
+    await navigator.clipboard.writeText(url);
+    status.textContent = "共有用リンクをコピーしました。会話やログイン情報は含みません。";
+  } catch {
+    field.value = url;
+    field.hidden = false;
+    field.focus();
+    field.select();
+    status.textContent = "自動コピーできませんでした。選択したリンクを手動でコピーしてください。";
+  }
+}
+
 // ── チャット ──────────────────────────────────────────────────────────────────
-function renderChat() {
+function renderLoginGate(title = "ログインして対話を始める") {
+  state.visibleMessages = [];
+  app.innerHTML = `<section class="purchase-view scroll-panel login-gate">
+    <p class="eyebrow">Dialogos</p><h1>${escapeHtml(title)}</h1>
+    <p class="lead">人格の持ち帰りと匿名のお試しにGoogleログインはいりません。<br>Googleアカウントに保存した対話の履歴を見る場合だけ、ログインが必要です。</p>
+    <button class="primary-button" data-takeaway="${state.philosopherId}" data-source="account">人格を無料で持ち帰る</button>
+    ${renderTrialOffer()}
+    <button class="secondary-button" data-login>Googleでログインして履歴を見る</button>
+    <p class="composer-note">お試しと人格の持ち帰りは無料です。</p>
+  </section>`;
+}
+
+function renderGuestGate(message = "") {
+  state.visibleMessages = [];
   const sage = getPhilosopherById(state.philosopherId);
-  const isContinuing = !!state.conversationId;
+  app.innerHTML = `<section class="purchase-view scroll-panel login-gate">
+    <p class="eyebrow">Free dialogue</p><h1>${escapeHtml(sage.name)}と、少し話してみる</h1>
+    <button class="primary-button" data-takeaway="${sage.id}" data-source="account">人格を無料で持ち帰る</button>
+    ${renderTrialOffer()}
+    <button class="secondary-button" data-guest-start ${state.anonymousEnabled ? "" : "disabled"}>ログインせずに試す</button>
+    <p id="guestStartStatus" role="status">${escapeHtml(message)}</p>
+    <p class="composer-note">匿名の無料枠にはCookieを使います。匿名の会話をGoogleアカウントの履歴に移すことはありません。持ち帰りのコピーには利用確認はいりません。</p>
+  </section>`;
+}
+
+async function handleGuestStart() {
+  if (state.loading || state.guestStarting || !state.anonymousEnabled || state.user?.logged_in) return;
+  state.guestStarting = true;
+  const epoch = state.identityEpoch;
+  const status = document.getElementById("guestStartStatus");
+  if (status) status.textContent = "このブラウザの無料枠を確認しています…";
+  app.querySelectorAll("[data-guest-start]").forEach(button => { button.disabled = true; });
+  try {
+    let guest;
+    try { guest = await apiService.getGuestMe(); }
+    catch (error) {
+      if (error.code !== "GUEST_SESSION_REQUIRED" || error.status !== 401) throw error;
+      if (epoch !== state.identityEpoch) return;
+      const token = await requestTurnstileToken({ siteKey: state.turnstileSiteKey, action: "guest_session" });
+      if (epoch !== state.identityEpoch) return;
+      guest = await apiService.startGuestSession(token);
+    }
+    if (epoch !== state.identityEpoch) return;
+    if (!guest?.is_guest || guest.logged_in || typeof guest.id !== "string") throw new Error("INVALID_GUEST");
+    invalidatePrivateView();
+    state.user = guest;
+    restorePendingChat();
+    scheduleTrialRefresh();
+    updateUsageMeter();
+    renderAuthNav();
+    renderChat();
+  } catch (error) {
+    if (epoch !== state.identityEpoch) return;
+    if (status) status.textContent = error.code === "TURNSTILE_CANCELLED"
+      ? "利用確認を取りやめました。返答は生成していません。人格は無料で持ち帰れます。"
+      : "今はお試し対話を始められません。利用確認・Cookieの許可を確認し、時間をおいてお試しください。人格の持ち帰りは利用できます。";
+  } finally {
+    if (epoch === state.identityEpoch) {
+      state.guestStarting = false;
+      app.querySelectorAll("[data-guest-start]").forEach(button => { button.disabled = !state.anonymousEnabled; });
+    }
+  }
+}
+
+function restorePendingChat() {
+  if (discardUnsupportedPendingChat()) return;
+  if (state.pendingChat && state.pendingChat.ownerId === state.user?.id && (state.pendingChat.ownerKind === "guest") === !!state.user?.is_guest) return;
+  state.pendingChat = null;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(PENDING_CHAT_KEY) || "null");
+    if (saved && saved.expectChargeSource !== "trial") {
+      sessionStorage.removeItem(PENDING_CHAT_KEY);
+      return;
+    }
+    if (saved?.ownerId === state.user?.id && (saved.ownerKind === "guest") === !!state.user?.is_guest && typeof saved.requestId === "string" &&
+      typeof saved.message === "string" && philosophers.some(sage => sage.id === saved.philosopherId)) {
+      state.pendingChat = saved;
+    }
+  } catch {}
+}
+
+function discardUnsupportedPendingChat() {
+  // Do not replay old paid/ambiguous requests, or relabel them as free.
+  if (!state.pendingChat || state.pendingChat.expectChargeSource === "trial") return false;
+  state.pendingChat = null;
+  savePendingChat();
+  return true;
+}
+
+function savePendingChat() {
+  try {
+    if (state.pendingChat) sessionStorage.setItem(PENDING_CHAT_KEY, JSON.stringify(state.pendingChat));
+    else sessionStorage.removeItem(PENDING_CHAT_KEY);
+  } catch {}
+}
+
+function showChatStatus(message, { retry = false, login = false, takeaway = false } = {}) {
+  const status = document.getElementById("chatStatus");
+  if (!status) return;
+  status.hidden = !message;
+  status.innerHTML = `<p>${escapeHtml(message)}</p>${retry ? `<button type="button" id="retryChatBtn" class="secondary-button">同じ問いの返答を確認</button>` : ""}${login ? `<button type="button" data-login class="secondary-button">Googleでログイン</button>` : ""}${takeaway ? `<button type="button" class="primary-button" data-takeaway="${state.philosopherId}" data-source="budget">人格を無料で持ち帰る</button>` : ""}`;
+  document.getElementById("retryChatBtn")?.addEventListener("click", handleSend);
+}
+
+function renderChat() {
+  state.visibleMessages = [];
+  if (!hasReplyIdentity()) { renderGuestGate(); return; }
+  if (state.pendingChat) {
+    state.philosopherId = state.pendingChat.philosopherId;
+    state.conversationId = state.pendingChat.conversationId;
+  }
+  const sage = getPhilosopherById(state.philosopherId);
+  const isContinuing = !!state.conversationId && !state.user?.is_guest;
 
   app.innerHTML = `
     <div class="chat-wrapper sage-stage">
@@ -430,6 +651,8 @@ function renderChat() {
         <div class="subtitle">${sage.subtitle}</div>
         <div class="divider"><span></span><i></i><span></span></div>
         <div class="usage-box">${usageSummaryText()}</div>
+        <button class="primary-button chat-takeaway-button" data-takeaway="${sage.id}" data-source="chat">人格を無料で持ち帰る</button>
+        <p class="composer-note">ご自身のChatGPTで続きを。会話を含めるかは、コピー前に選べます。</p>
       </header>
 
       <div class="chat-body">
@@ -474,17 +697,21 @@ function renderChat() {
             <div class="input-row">
               <label class="input-wrapper">
                 <span>あなたの問い — Your Question</span>
-                <textarea id="messageInput" rows="2" placeholder="${sage.name}に問いかけてください"></textarea>
+                <textarea id="messageInput" rows="2" placeholder="${sage.name}に問いかけてください" aria-describedby="composerNote"></textarea>
               </label>
               <button class="send-button" type="submit" aria-label="送信">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
               </button>
             </div>
+            <p class="composer-note" id="composerNote">${composerNoteText()}</p>
+            <div id="chatAccessNotice" class="chat-access-notice" role="status" hidden></div>
+            <div id="chatStatus" class="chat-status" role="status" hidden></div>
             <div class="suggestions">
               <span>テーマを選ぶ — Choose a Theme</span>
               ${sage.themes.map((t) => `<button type="button" data-topic="${escapeHtml(t)}">${t}</button>`).join("")}
             </div>
           </form>
+          <section id="dialogueReflection" class="dialogue-reflection" hidden aria-label="対話の整理"></section>
           <footer class="solo-footer">${sage.footer}</footer>
         </div>
       </div>
@@ -495,7 +722,7 @@ function renderChat() {
 
   const input = document.querySelector("#messageInput");
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.querySelector("#composer").requestSubmit(); }
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); document.querySelector("#composer").requestSubmit(); }
   });
   input.addEventListener("input", function () {
     this.style.height = "auto";
@@ -522,10 +749,13 @@ function renderChat() {
   backdropEl.addEventListener("click", closeSidebar);
 
   document.getElementById("sidebarNewBtn").addEventListener("click", () => {
+    if (state.loading || state.pendingChat) {
+      showChatStatus("前の問いの返答を確認してから、新しい対話を始められます。", { retry: !!state.pendingChat && !state.loading });
+      return;
+    }
     state.conversationId = null;
     closeSidebar();
     renderChat();
-    loadSidebarHistory();
   });
 
   loadSidebarHistory();
@@ -533,6 +763,41 @@ function renderChat() {
   if (isContinuing) {
     loadExistingMessages(sage);
   }
+  if (state.pendingChat) {
+    input.value = state.pendingChat.message;
+    input.readOnly = true;
+    if (!isContinuing) appendMessage("user", "あなた", state.pendingChat.message, null, state.pendingChat.requestId);
+    showChatStatus("前の問いの返答を確認できます。確認のために新しい問いを送信する必要はありません。", { retry: true });
+  }
+  updateChatAccess();
+}
+
+function composerNoteText() {
+  const cost = canUseTrial() ? `今日の無料対話：全賢者で残り${trialRemaining()}往復。日本時間0時更新。`
+    : !state.trial.enabled
+      ? "無料対話は受付を休止しています。人格の持ち帰りは利用できます。"
+      : "サイト内の対話は受付終了です。人格を無料で持ち帰って続けられます。";
+  return `${cost}1回の入力は${MAX_MESSAGE_CHARS.toLocaleString()}文字まで。Enterで送信／Shift + Enterで改行。`;
+}
+
+function updateChatAccess() {
+  const input = document.getElementById("messageInput");
+  const button = document.querySelector(".send-button");
+  const notice = document.getElementById("chatAccessNotice");
+  const blocked = !state.pendingChat && !canStartReply();
+  if (input) input.disabled = state.loading || blocked;
+  if (button) button.disabled = state.loading || blocked;
+  if (!notice) return;
+  notice.hidden = !blocked;
+  if (!blocked) { notice.innerHTML = ""; return; }
+  const exhausted = state.trial.enabled && state.user?.trial_eligible === true && trialRemaining() === 0;
+  const trialPaused = !state.trial.enabled;
+  const message = trialPaused
+    ? "サイト内の無料対話は現在休止中です。人格の持ち帰りはいつでも利用できます。"
+    : exhausted
+    ? Number(state.user.trial_reserved) > 0 ? "無料対話の返答を確認中です。同じ問いの確認が終わるまでお待ちください。" : "今日の無料対話3往復が終わりました。全賢者で共通の回数です。日本時間0時に更新されます。続きは人格を持ち帰り、ご自身のChatGPTでどうぞ。"
+    : "サイト内のお試し対話は今は利用できません。人格はログインせずに無料で持ち帰れます。";
+  notice.innerHTML = `<p>${message}</p><button class="primary-button" type="button" data-takeaway="${state.philosopherId}" data-source="limit">人格を無料で持ち帰る</button>`;
 }
 
 function sidebarDateLabel(dateStr) {
@@ -559,8 +824,12 @@ function formatSidebarTime(dateStr) {
 async function loadSidebarHistory() {
   const list = document.getElementById("sidebarHistoryList");
   if (!list) return;
+  if (state.user?.is_guest) { list.innerHTML = '<p class="sidebar-empty">匿名の会話はこの画面で確認できます。再読み込み前に必要な内容をコピーしてください。</p>'; return; }
+  const owner = identityKey(), epoch = state.identityEpoch, philosopherId = state.philosopherId;
+  const current = () => epoch === state.identityEpoch && owner === identityKey() && philosopherId === state.philosopherId && document.getElementById("sidebarHistoryList") === list;
   try {
     const all = await apiService.getHistory();
+    if (!current()) return;
     state.history = all;
     const filtered = all.filter((h) => h.philosopher_id === state.philosopherId);
 
@@ -593,98 +862,210 @@ async function loadSidebarHistory() {
       }).join("")}
     `).join("");
   } catch {
+    if (!current()) return;
     list.innerHTML = `<p class="sidebar-empty">読み込みに失敗</p>`;
   }
 }
 
 async function loadExistingMessages(sage) {
-  if (!state.conversationId) return;
+  if (!state.conversationId || state.user?.is_guest) return;
+  const conversationId = state.conversationId;
+  const owner = identityKey(), epoch = state.identityEpoch;
+  const target = document.querySelector("#chatArea");
+  const current = () => epoch === state.identityEpoch && owner === identityKey() && document.querySelector("#chatArea") === target && state.conversationId === conversationId;
+  state.messagesLoading = true;
   try {
-    const messages = await apiService.getConversationMessages(state.conversationId);
+    const data = await apiService.getConversationMessages(conversationId);
+    if (!current()) return;
+    const messages = Array.isArray(data) ? data : data.messages || [];
     const chatArea = document.querySelector("#chatArea");
-    if (!chatArea || !messages.length) return;
+    if (!chatArea || chatArea !== target || state.conversationId !== conversationId || !messages.length) return;
     chatArea.querySelector(".welcome")?.remove();
-    messages.forEach(({ role, content }) => {
+    messages.forEach(({ role, content, request_id }) => {
+      if (role !== "user" && role !== "assistant") return;
       const msgRole = role === "assistant" ? "sage" : "user";
       const label   = role === "assistant" ? (sage.displayName || sage.name) : "あなた";
-      const portrait = role === "assistant" ? sage.portrait : null;
-      appendMessage(msgRole, label, String(content ?? ""), portrait);
+      const portrait = role === "assistant" ? (sage.portraitIcon || sage.portrait) : null;
+      appendMessage(msgRole, label, String(content ?? ""), portrait, request_id);
     });
+    renderReflection(data.conversation?.dialogue_state);
   } catch {
-    // サマリー経由でAIが文脈を把握するので無視
+    if (current()) showChatStatus("対話の記録を読み込めませんでした。画面を開き直すと、もう一度確認できます。");
+  } finally {
+    if (!current()) return;
+    state.messagesLoading = false;
+    if (document.querySelector("#chatArea") === target && state.pendingChat?.conversationId === conversationId) {
+      appendMessage("user", "あなた", state.pendingChat.message, null, state.pendingChat.requestId);
+    }
   }
 }
 
 function usageSummaryText() {
   const u = state.user;
-  if (!u) return "賢者との対話は、この端末に刻まれる";
-  if (u.credits > 0) return `✦ 灯火 ${u.credits} · 賢者があなたを覚えている`;
-  if (u.free_count > 0) return `残り ${u.free_count} 問の試み · 灯火を継ぐと全賢者と対話できる`;
-  return "灯火を継いで、対話を続けよ";
+  if (!hasReplyIdentity()) return "ログイン不要のお試し対話";
+  const trial = state.trial.enabled && u.trial_eligible === true ? `今日の無料 残り${trialRemaining()}/3往復 · 全賢者共通・日本時間0時更新${Number(u.trial_reserved) > 0 ? `（確認中${Number(u.trial_reserved)}往復）` : ""}` : "サイト内の無料対話は現在休止中";
+  return trial;
 }
 
 // ── チャット送信 ──────────────────────────────────────────────────────────────
 async function handleSend(e) {
   e.preventDefault();
-  if (state.loading) return;
-
-  const input   = document.querySelector("#messageInput");
+  if (state.loading || state.messagesLoading || state.guestStarting) return;
+  if (!hasReplyIdentity()) { renderGuestGate(); return; }
+  const input = document.querySelector("#messageInput");
   const sendBtn = document.querySelector(".send-button");
-  const text    = input.value.trim();
-  if (!text) return;
-
-  const sage    = getPhilosopherById(state.philosopherId);
-  state.loading = true;
-  input.value   = "";
-  input.style.height = "auto";
-  if (sendBtn) {
-    sendBtn.disabled  = true;
-    sendBtn.innerHTML = `<svg class="spin" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke-dasharray="12 38" stroke-linecap="round"/></svg>`;
+  if (discardUnsupportedPendingChat()) {
+    if (input) input.readOnly = false;
+    showChatStatus("この画面では確認できない送信データです。自動で再送はしません。必要なら履歴をご確認ください。", { takeaway: true });
+    updateChatAccess();
+    return;
   }
-  appendMessage("user", "あなた", text);
-  showThinking(sage);
+  const text = state.pendingChat?.message || input.value.trim();
+  if (!text) return;
+  if ([...text].length > MAX_MESSAGE_CHARS) {
+    showChatStatus(`問いを${MAX_MESSAGE_CHARS.toLocaleString()}文字以内にしてください。長いお話は分けて続けられます。`);
+    return;
+  }
+  if (!state.pendingChat && !canStartReply()) { updateChatAccess(); return; }
+
+  const sage = getPhilosopherById(state.philosopherId);
+  const guest = state.user.is_guest === true;
+  const request = state.pendingChat || { requestId: crypto.randomUUID(), ownerId: state.user.id,
+    ownerKind: guest ? "guest" : "account", philosopherId: state.philosopherId,
+    conversationId: state.conversationId, message: text, expectChargeSource: "trial" };
+  const epoch = state.identityEpoch;
+  const needsProof = guest && (!state.pendingChat || state.pendingChat.needsProof === true);
+  state.activeRequestId = request.requestId;
+  const isCurrentRequest = () => state.identityEpoch === epoch && state.user?.id === request.ownerId &&
+    !!state.user?.is_guest === guest && state.activeRequestId === request.requestId;
+  state.loading = true;
+  input.value = text;
+  input.readOnly = true;
+  if (sendBtn) sendBtn.disabled = true;
+  showChatStatus(needsProof ? "利用確認が完了するまで、返答は生成されません。" : "");
 
   try {
-    const result = await apiService.sendChat({
-      philosopherId:  state.philosopherId,
-      conversationId: state.conversationId,
-      message:        text,
-    });
+    let turnstileToken;
+    if (needsProof) {
+      if (!state.anonymousEnabled) throw Object.assign(new Error(), { code: "GUEST_NOT_READY" });
+      turnstileToken = await requestTurnstileToken({ siteKey: state.turnstileSiteKey, action: "guest_chat", requestId: request.requestId });
+      if (!isCurrentRequest()) return;
+    }
+    state.pendingChat = { ...request };
+    delete state.pendingChat.needsProof;
+    savePendingChat(); // Deliberately excludes the one-use proof.
+    appendMessage("user", "あなた", text, null, request.requestId);
+    showThinking(sage);
+    const result = guest
+      ? await apiService.sendGuestChat({ ...request, turnstileToken })
+      : await apiService.sendChat(request);
+    if (!isCurrentRequest()) return;
+    if (!result.reply || typeof result.reply !== "string" || (result.user && identityKey(result.user) !== identityKey())) {
+      throw Object.assign(new Error("応答を確認中です。"), { code: "REQUEST_PENDING" });
+    }
     state.conversationId = result.conversationId;
     hideThinking();
-    appendMessage("sage", sage.displayName || sage.name, result.reply, sage.portrait);
-    state.user = result.user;
+    appendMessage("sage", sage.displayName || sage.name, result.reply, sage.portraitIcon || sage.portrait, request.requestId);
+    state.pendingChat = null;
+    savePendingChat();
+    input.value = "";
+    input.style.height = "auto";
+    if (result.user) state.user = result.user;
+    scheduleTrialRefresh();
     updateUsageMeter();
+    renderReflection(result.state);
+    loadSidebarHistory();
+    showChatStatus("");
   } catch (err) {
+    if (!isCurrentRequest()) return;
     hideThinking();
-    if (err.code === "LOCKED") {
-      showLockOverlay(sage);
+    const proofErrors = ["TURNSTILE_REQUIRED", "TURNSTILE_FAILED", "TURNSTILE_UNAVAILABLE", "TURNSTILE_LOAD_FAILED",
+      "TURNSTILE_NOT_CONFIGURED", "TURNSTILE_CANCELLED", "TURNSTILE_EXPIRED", "TURNSTILE_TIMEOUT"];
+    if (guest && proofErrors.includes(err.code)) {
+      if (state.pendingChat) { state.pendingChat.needsProof = true; savePendingChat(); }
+      showChatStatus(err.code === "TURNSTILE_CANCELLED"
+        ? "利用確認を取りやめました。新しい返答は生成していません。"
+        : "利用確認を完了できませんでした。この操作では新しい返答・回数の消費はありません。再操作で確認できます。",
+        { retry: !!state.pendingChat, takeaway: true });
+    } else if (guest && err.status === 401) {
+      state.pendingChat = null;
+      savePendingChat();
+      invalidatePrivateView();
+      state.user = null;
+      updateUsageMeter();
+      renderGuestGate("匿名の利用状態を確認できませんでした。Cookieを許可してお試しを開始してください。前の問い合わせを別の利用状態へ自動送信することはありません。");
     } else {
-      appendMessage("sage", sage.displayName || sage.name, "いま、神託の声が遠い。しばらく時間を置いてから、再び問いかけてください。", sage.portrait);
+      const refused = ["LOCKED", "BALANCE_CHANGED", "BUDGET_EXHAUSTED", "TRIAL_BUDGET_EXHAUSTED", "TRIAL_NOT_READY",
+        "IN_FLIGHT", "RATE_LIMIT", "RATE_LIMITED", "NETWORK_RATE_LIMITED", "INVALID_MESSAGE", "MESSAGE_TOO_LONG",
+        "GENERATION_FAILED", "TOKEN_COUNT_UNAVAILABLE", "AI_NOT_CONFIGURED", "AUTH_NOT_CONFIGURED", "BILLING_NOT_READY",
+        "MIGRATION_REQUIRED", "DB_NOT_CONFIGURED", "CONVERSATION_NOT_FOUND", "GUEST_NOT_READY", "GUEST_ORIGIN_REJECTED", "GUEST_NETWORK_UNAVAILABLE"];
+      if (refused.includes(err.code) || (err.status === 400 && err.code !== "REQUEST_CONFLICT")) {
+        state.pendingChat = null;
+        savePendingChat();
+        showChatStatus(err.code === "BALANCE_CHANGED"
+          ? "無料対話の残り回数が変わりました。この問いの回数は消費していません。残り回数を確認してから、改めて送信してください。"
+          : err.code === "GENERATION_FAILED"
+            ? "返答を作成できませんでした。この問いの無料回数は消費されていません。内容を確認して、もう一度送信できます。"
+          : err.code === "TRIAL_BUDGET_EXHAUSTED"
+            ? "無料体験の受付上限に達しています。無料回数は消費されていません。時間をおいてお試しください。"
+          : err.code === "NETWORK_RATE_LIMITED"
+            ? "この回線からの利用上限に達しています。無料回数は消費されていません。時間をおいてお試しください。人格のコピーは利用できます。"
+          : ["BUDGET_EXHAUSTED", "TRIAL_NOT_READY", "AI_NOT_CONFIGURED", "AUTH_NOT_CONFIGURED", "BILLING_NOT_READY",
+            "MIGRATION_REQUIRED", "DB_NOT_CONFIGURED", "GUEST_NOT_READY", "GUEST_NETWORK_UNAVAILABLE"].includes(err.code)
+            ? "ただいま対話の受付を休止しています。無料回数は消費されていません。人格の持ち帰りは利用できます。"
+            : "この問いは受け付けられませんでした。無料回数は消費されていません。残り回数と入力内容を確認し、時間をおいてお試しください。", { takeaway: true });
+        await refreshUser();
+      } else if (err.status === 401) {
+        showChatStatus("ログイン状態を確認してください。再ログイン後、同じ問いの返答を確認できます。", { login: true });
+      } else {
+        showChatStatus(err.code === "REQUEST_UNKNOWN"
+          ? "返答の結果を確認できていません。この問いの利用回数は確認のため保留されています。同じ問いの状況を確認できます。"
+          : "返答を確認中です。少し待ってから同じ問いの返答を確認してください。新しい問いとしては送信しません。", { retry: true });
+      }
     }
   } finally {
+    if (!isCurrentRequest()) return;
+    state.activeRequestId = null;
     state.loading = false;
+    input.readOnly = !!state.pendingChat;
     input.focus();
-    if (sendBtn) {
-      sendBtn.disabled  = false;
-      sendBtn.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
-    }
+    updateChatAccess();
   }
 }
 
+function renderReflection(dialogueState) {
+  const panel = document.getElementById("dialogueReflection");
+  if (!panel || !dialogueState || typeof dialogueState !== "object") return;
+  const textList = value => Array.isArray(value) ? value.filter(item => typeof item === "string").slice(0, 3).join("／") : "";
+  const revisions = Array.isArray(dialogueState.revisions) ? dialogueState.revisions
+    .filter(item => typeof item?.from === "string" && typeof item?.to === "string")
+    .slice(0, 2).map(item => `${item.from} → ${item.to}`).join("／") : "";
+  const fields = [["確かめた言葉", textList(dialogueState.definitions)], ["いまの考え", textList(dialogueState.claims)],
+    ["考え直した点", revisions], ["残っている問い", textList(dialogueState.openQuestions)]].filter(([, value]) => value);
+  if (!fields.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+  panel.innerHTML = `<h2>対話のメモ</h2><p class="composer-note">AIによる整理です。違うと感じたところは、次の問いで伝えてください。</p><dl>${fields.map(([label, value]) => `<div><dt>${label}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl>`;
+}
+
 // ── メッセージ追加 ─────────────────────────────────────────────────────────────
-function appendMessage(role, label, text, portrait) {
+function appendMessage(role, label, text, portrait, requestId) {
   const chatArea = document.querySelector("#chatArea");
   if (!chatArea) return;
+  if (requestId && [...chatArea.children].some(child => child.dataset?.requestId === requestId && child.dataset?.messageRole === role)) return;
   chatArea.querySelector(".welcome")?.remove();
   const div = document.createElement("div");
   div.className = `message ${role}`;
+  if (requestId) {
+    div.dataset.requestId = requestId;
+    div.dataset.messageRole = role;
+  }
   const icon = (role === "sage" && portrait)
-    ? `<img class="msg-sage-icon" src="${portrait}" alt="" onerror="this.style.display='none'">`
+    ? `<img class="msg-sage-icon" src="${portrait}" alt="" width="32" height="32" loading="lazy" decoding="async" onerror="this.style.display='none'">`
     : "";
   div.innerHTML = `<div class="message-label">${icon}${escapeHtml(label)}</div><div class="message-bubble">${escapeHtml(text)}</div>`;
   div.style.animation = "fadeIn 0.45s ease forwards";
   chatArea.appendChild(div);
+  if (role === "user" || role === "sage") state.visibleMessages.push({ role: role === "sage" ? "assistant" : "user", content: String(text) });
   chatArea.scrollTop = chatArea.scrollHeight;
 }
 
@@ -695,7 +1076,7 @@ function showThinking(sage) {
   div.id         = "thinking";
   div.className  = "thinking";
   div.innerHTML  = `
-    <img class="msg-sage-icon" src="${sage.portrait}" alt="" onerror="this.style.display='none'">
+    <img class="msg-sage-icon" src="${sage.portraitIcon || sage.portrait}" alt="" width="32" height="32" decoding="async" onerror="this.style.display='none'">
     <div class="thinking-dots"><span></span><span></span><span></span></div>
     <em>${escapeHtml(sage.thinkingText)}</em>
   `;
@@ -708,376 +1089,11 @@ function hideThinking() {
 }
 
 // ── ロックオーバーレイ ─────────────────────────────────────────────────────────
-function showLockOverlay(sage) {
-  const container = document.querySelector(".scroll-container");
-  if (!container || container.querySelector(".lock-overlay")) return;
 
-  const overlay = document.createElement("div");
-  overlay.className = "lock-overlay";
-  const isLoggedIn = state.user?.logged_in;
-  overlay.innerHTML = `
-    <div class="lock-sigil">灯</div>
-    <h2>賢者は静かに沈黙した。</h2>
-    <p class="lock-lead">
-      問いはまだ終わっていない。<br>
-      ${escapeHtml(sage.name)}との続きを望むなら、灯火を継いでください。
-    </p>
-    ${!isLoggedIn && !IN_APP_BROWSER ? `
-    <div style="margin:16px 0 24px;padding:16px;border:1px solid rgba(212,168,67,0.3);border-radius:10px;text-align:center">
-      <p style="font-size:13px;color:rgba(245,234,214,0.65);margin:0 0 12px">購入済みのアカウントをお持ちの方はログインで復元できます</p>
-      <button id="lockLoginBtn" class="primary-button" style="width:100%">Googleでログインして続ける</button>
-    </div>
-    ` : ``}
-    <ul class="lock-value">
-      <li>灯火1つにつき、賢者からの応答が1回届きます。</li>
-      <li>記憶の書では、次回も問いの続きから再開できます。</li>
-      <li>決済はStripeの安全なページで行われます。</li>
-    </ul>
-    ${renderPackageGrid(true)}
-    <p class="purchase-error" id="lockError"></p>
-    <button class="lock-purchase-link" data-route="purchase">灯火の購入ページへ</button>
-  `;
-
-  container.appendChild(overlay);
-
-  overlay.querySelector("#lockLoginBtn")?.addEventListener("click", handleGoogleLogin);
-
-  overlay.querySelectorAll(".purchase-card").forEach((card) => {
-    card.addEventListener("click", () => handlePurchaseClick(card.dataset.pkg, "lockError"));
-    card.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handlePurchaseClick(card.dataset.pkg, "lockError"); }
-    });
-  });
-}
-
-// ── 購入フロー ────────────────────────────────────────────────────────────────
-async function handlePurchaseClick(pkgId, errorElementId) {
-  const errorEl = document.getElementById(errorElementId);
-  const loading = document.getElementById("purchaseLoading");
-  if (errorEl) errorEl.textContent = "";
-  if (loading) loading.style.display = "block";
-
-  try {
-    const { url, sessionId } = await apiService.createCheckout(pkgId);
-    if (sessionId) sessionStorage.setItem("dialogos.pendingSession", sessionId);
-    window.location.href = url;
-  } catch (err) {
-    const msg = err.code === "STRIPE_NOT_CONFIGURED"
-      ? "現在、決済ページを開けません。Stripe設定を確認してください。"
-      : "いま、通行証を受け取れない。しばらく待ってからお試しください。";
-    if (errorEl) errorEl.textContent = msg;
-    if (loading) loading.style.display = "none";
-  }
-}
-
-// ── サブスク管理ビュー ────────────────────────────────────────────────────────
-async function renderSubscription() {
-  app.innerHTML = `
-    <section class="sub-view scroll-panel">
-      <p class="eyebrow">Membership</p>
-      <h1>記憶の書</h1>
-      <p class="lead">賢者があなたの問いを覚え、続きを次へ繋ぐ。</p>
-      <div id="subStatus">
-        <div class="sub-loading">
-          <div class="sub-spinner"></div>
-          <span>確認中…</span>
-        </div>
-      </div>
-    </section>
-  `;
-
-  try {
-    let sub = await apiService.getSubscription();
-
-    if ((sub.status === "active" || sub.status === "trialing") && !sub.currentPeriodEnd) {
-      try {
-        await apiService.restoreSubscription();
-        sub = await apiService.getSubscription();
-      } catch {}
-    }
-
-    renderSubStatus(sub);
-  } catch {
-    const el = document.getElementById("subStatus");
-    if (el) el.innerHTML = `<p class="sub-error">情報の取得に失敗しました。再読み込みをお試しください。</p>`;
-  }
-}
-
-function renderSubStatus(sub) {
-  const el = document.getElementById("subStatus");
-  if (!el) return;
-
-  const periodEnd = sub.currentPeriodEnd ? new Date(sub.currentPeriodEnd) : null;
-  const periodEndStr = periodEnd
-    ? periodEnd.toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric" })
-    : "—";
-  const stillInPeriod = periodEnd && periodEnd > new Date();
-
-  // activeまたは「canceledだが期間内」の場合はアクティブカードを表示
-  const showActiveCard = sub.status === "active" || sub.status === "trialing"
-    || (sub.status === "canceled" && sub.cancelAtPeriodEnd && stillInPeriod);
-
-  if (showActiveCard) {
-    const credits = state.user?.credits ?? "—";
-    const isCanceling = sub.cancelAtPeriodEnd || sub.status === "canceled";
-    const dateDisplay = periodEnd
-      ? periodEndStr
-      : `<span style="color:#e08080">取得できませんでした</span>`;
-    const cancelNote = isCanceling
-      ? `<p style="color:#e08080;font-size:13px;margin:0">解約申請済み — ${periodEnd ? periodEndStr : "—"} まで利用可能</p>`
-      : `<p class="sub-period">次回更新：${dateDisplay}</p>`;
-
-    el.innerHTML = `
-      <div class="sub-card active">
-        <div class="sub-status-badge active">${isCanceling ? "解約申請済み" : "有効"}</div>
-        <div class="sub-plan">記憶の書 — ¥680 / 月</div>
-        ${cancelNote}
-        <div class="sub-credits">現在の灯火：${credits}</div>
-        <div class="sub-actions">
-          <button class="primary-button" id="portalBtn">Stripe で管理する</button>
-          ${isCanceling ? "" : `<button class="secondary-button sub-cancel-btn" id="cancelBtn">解約する</button>`}
-        </div>
-      </div>
-    `;
-    document.getElementById("portalBtn")?.addEventListener("click", handlePortal);
-    document.getElementById("cancelBtn")?.addEventListener("click", handleCancel);
-
-  } else {
-    const label      = sub.status === "canceled" ? "解約済み" : sub.status === "past_due" ? "支払い遅延" : "未加入";
-    const badgeClass = sub.status === "canceled" ? "canceled" : "inactive";
-    el.innerHTML = `
-      <div class="sub-card">
-        <div class="sub-status-badge ${badgeClass}">${label}</div>
-        <p style="color:rgba(245,234,214,0.65);font-size:14px;line-height:1.8;margin:0">
-          記憶の書に加入すると、賢者があなたの問いを覚え、<br>毎月 60 灯火を受け取れます。
-        </p>
-        <div class="sub-actions">
-          <button class="primary-button" data-route="purchase">記憶の書を開く</button>
-        </div>
-      </div>
-    `;
-  }
-}
-
-
-// ── 解約ページ（ログイン不要・メールアドレスで対応）────────────────────────────
-function renderCancel() {
-  const loggedIn = state.user?.logged_in;
-  app.innerHTML = `
-    <section class="sub-view scroll-panel">
-      <p class="eyebrow">解約手続き</p>
-      <h1>記憶の書を解約する</h1>
-      ${!loggedIn && !IN_APP_BROWSER ? `
-      <div style="max-width:400px;margin:0 auto 24px;padding:16px;border:1px solid rgba(212,168,67,0.3);border-radius:10px;text-align:center">
-        <p style="font-size:13px;color:rgba(245,234,214,0.65);margin:0 0 12px;line-height:1.7">
-          Googleアカウントでログインすると、<br>Stripeポータルから簡単に解約できます。
-        </p>
-        <button id="cancelLoginBtn" class="primary-button" style="width:100%">Googleでログインして解約</button>
-      </div>
-      <p style="text-align:center;font-size:12px;color:rgba(245,234,214,0.3);margin-bottom:16px">または、メールアドレスで手続き</p>
-      ` : ``}
-      <p class="lead" style="color:rgba(245,234,214,0.6);font-size:14px;line-height:1.8">
-        Stripeの受領メールに記載のアドレスで解約できます。
-      </p>
-      <div style="max-width:400px;margin:24px auto 0">
-        <input id="cancelEmailInput" type="email" placeholder="購入時のメールアドレス"
-          style="width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;border:1px solid rgba(245,234,214,0.3);background:rgba(0,0,0,0.3);color:#f5ead6;font-size:15px;margin-bottom:10px">
-        <button class="secondary-button" id="cancelByEmailBtn" style="width:100%">解約手続きをする</button>
-        <p id="cancelResult" style="margin-top:12px;font-size:14px;min-height:1.4em;text-align:center"></p>
-        <p style="margin-top:20px;font-size:12px;color:rgba(245,234,214,0.35);text-align:center;line-height:1.8">
-          解約後も契約期間終了日まで引き続きご利用いただけます。<br>
-          月の途中での返金は行っておりません。
-        </p>
-      </div>
-      <div style="text-align:center;margin-top:24px">
-        <button data-route="list" style="background:none;border:none;color:rgba(245,234,214,0.35);cursor:pointer;font-size:13px">← 戻る</button>
-      </div>
-    </section>
-  `;
-  document.getElementById("cancelLoginBtn")?.addEventListener("click", handleGoogleLogin);
-  document.getElementById("cancelByEmailBtn")?.addEventListener("click", handleCancelByEmail);
-}
-
-async function handleCancelByEmail() {
-  const input = document.getElementById("cancelEmailInput");
-  const btn = document.getElementById("cancelByEmailBtn");
-  const result = document.getElementById("cancelResult");
-  const email = input?.value.trim();
-  if (!email) { result.style.color = "#e08080"; result.textContent = "メールアドレスを入力してください。"; return; }
-  btn.textContent = "確認中…"; btn.disabled = true;
-  result.textContent = "";
-  try {
-    const data = await apiService.cancelByEmail(email);
-    result.style.color = "#7ecfa0";
-    result.textContent = data.message;
-    btn.style.display = "none";
-    await refreshUser();
-  } catch (err) {
-    result.style.color = "#e08080";
-    result.textContent = err.message || "エラーが発生しました。しばらく待ってから再試行してください。";
-    btn.textContent = "解約手続きをする"; btn.disabled = false;
-  }
-}
-
-async function handleRestoreByEmail() {
-  const emailInput = document.getElementById("restoreEmailInput");
-  const btn = document.getElementById("restoreByEmailBtn");
-  const errEl = document.getElementById("restoreSubError");
-  const email = emailInput?.value.trim();
-  if (!email) { if (errEl) errEl.textContent = "メールアドレスを入力してください。"; return; }
-  if (btn) { btn.textContent = "確認中…"; btn.disabled = true; }
-  if (errEl) { errEl.textContent = ""; errEl.style.color = "#e08080"; }
-  try {
-    const user = await apiService.restoreByEmail(email);
-    state.user = user;
-    updateUsageMeter();
-    await refreshUser();
-    if (errEl) { errEl.style.color = "#7ecfa0"; errEl.textContent = "反映されました。"; }
-    setTimeout(() => renderSubscription(), 800);
-  } catch (err) {
-    const msg = err.code === "NO_CUSTOMER" || err.code === "NO_ACTIVE_SUB"
-      ? err.message
-      : `エラー（${err.code || "UNKNOWN"}）。しばらく待ってから再試行してください。`;
-    if (errEl) errEl.textContent = msg;
-    if (btn) { btn.textContent = "このメールアドレスで同期する"; btn.disabled = false; }
-  }
-}
-
-async function handlePortal() {
-  const btn = document.getElementById("portalBtn");
-  if (btn) { btn.textContent = "移動中…"; btn.disabled = true; }
-  try {
-    const { url } = await apiService.createPortal();
-    window.location.href = url;
-  } catch (err) {
-    if (btn) { btn.textContent = "Stripe で管理する"; btn.disabled = false; }
-    alert(err.message || "ポータルを開けませんでした。");
-  }
-}
-
-async function handleCancel() {
-  if (!confirm("本当に解約しますか？\n解約後も期間終了日まで引き続き利用できます。")) return;
-  const btn = document.getElementById("cancelBtn");
-  if (btn) { btn.textContent = "処理中…"; btn.disabled = true; }
-  try {
-    await apiService.cancelSubscription();
-    await refreshUser();
-    const sub = await apiService.getSubscription();
-    renderSubStatus(sub);
-  } catch (err) {
-    if (btn) { btn.textContent = "解約する"; btn.disabled = false; }
-    alert(err.message || "解約処理に失敗しました。");
-  }
-}
-
-// ── 購入ビュー ────────────────────────────────────────────────────────────────
-function renderPurchase() {
-  app.innerHTML = `
-    <section class="purchase-view scroll-panel">
-      <p class="eyebrow">Tomoshibi — 灯火の書</p>
-      <h1>灯火を継ぐ</h1>
-      <p class="lead">
-        一つの問いに、一つの灯火が燃える。<br>問いは一度では終わらない——灯火を継ぎ、対話を続けよ。
-      </p>
-
-      <div class="value-pillars">
-        <div class="value-pillar">
-          <span class="value-pillar-icon">✦</span>
-          <strong>賢者があなたを覚える</strong>
-          <p>前回の問い、選んだ賢者、揺らぎが積み重なる。対話は回を重ねるほど、あなたの奥へ届くようになる。</p>
-        </div>
-        <div class="value-pillar">
-          <span class="value-pillar-icon">∞</span>
-          <strong>全14賢者と対話できる</strong>
-          <p>ソクラテスで崩れた前提を、ブッダで観察する。14人すべてに、制限なく問いかけられる。</p>
-        </div>
-        <div class="value-pillar">
-          <span class="value-pillar-icon">◎</span>
-          <strong>毎月60灯火</strong>
-          <p>月に60の灯火が届く。問いが続く限り、火は補われる。</p>
-        </div>
-      </div>
-
-      <div class="purchase-section-label">✦ 記憶の書 — 賢者があなたを覚える月額プラン</div>
-      ${renderPackageGrid(false, "subscription")}
-
-      <div class="purchase-section-label">灯火を足す — 必要な分だけ</div>
-      ${renderPackageGrid(false, "credits")}
-
-      <p class="purchase-error" id="purchaseError"></p>
-      <p class="purchase-loading" id="purchaseLoading" style="display:none">扉が開いている……</p>
-
-      <div class="purchase-trust">
-        <span>Stripe 安全決済</span>
-        <span>即時反映</span>
-        <span>月額プランはいつでも解約可能</span>
-      </div>
-
-    </section>
-  `;
-
-  app.querySelectorAll(".purchase-card").forEach((card) => {
-    if (card.classList.contains("purchase-card--subscribed")) return; // data-route で処理
-    card.addEventListener("click", () => handlePurchaseClick(card.dataset.pkg, "purchaseError"));
-    card.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); handlePurchaseClick(card.dataset.pkg, "purchaseError"); }
-    });
-  });
-
-}
-
-function renderPackageGrid(compact, kind = null) {
-  const packages = kind ? state.packages.filter((pkg) => pkg.kind === kind) : state.packages;
-  if (!packages.length) {
-    return `<p class="purchase-unavailable">現在、決済の準備中です。しばらく待ってからお試しください。</p>`;
-  }
-
-  const isSubscribed = state.user?.subscription_status === "active";
-
-  const cards = packages.map((pkg) => {
-    const featured = pkg.id === "memory_book_monthly";
-    const unit     = pkg.kind === "subscription" ? "/月" : "";
-    const cost     = pkg.kind === "credits"
-      ? `<small class="purchase-unit">1灯火 約${Math.ceil(pkg.price_jpy / pkg.credits)}円</small>`
-      : `<small class="purchase-unit">1日あたり約23円</small>`;
-
-    // サブスク加入済みの場合、記憶の書カードを「管理画面へ」に差し替え
-    if (pkg.kind === "subscription" && isSubscribed) {
-      return `
-        <div class="purchase-card featured purchase-card--subscribed" role="button" tabindex="0" data-route="subscription">
-          <div class="purchase-badge">✦ 加入中</div>
-          <div class="purchase-name">${pkg.name}</div>
-          <div class="purchase-price">¥${pkg.price_jpy.toLocaleString()}${unit}</div>
-          <div class="purchase-credits">
-            <span class="purchase-cr">有効</span>
-            <small>解約・変更は管理画面から</small>
-          </div>
-          <div class="purchase-cta">管理画面へ →</div>
-        </div>
-      `;
-    }
-
-    const cta = featured ? "記憶の書を開く" : "灯火を継ぐ";
-    return `
-      <div class="purchase-card${featured ? " featured" : ""}" data-pkg="${pkg.id}" role="button" tabindex="0">
-        ${featured ? `<div class="purchase-badge">✦ おすすめ</div>` : ""}
-        <div class="purchase-name">${pkg.name}</div>
-        <div class="purchase-price">¥${pkg.price_jpy.toLocaleString()}${unit}</div>
-        <div class="purchase-credits">
-          <span class="purchase-cr">${pkg.credits}灯火</span>
-          <small>${pkg.description || ""}</small>
-          ${compact ? "" : cost}
-        </div>
-        <div class="purchase-cta">${cta}</div>
-      </div>
-    `;
-  }).join("");
-
-  return `<div class="purchase-grid ${kind ? `purchase-grid-${kind}` : ""}">${cards}</div>`;
-}
 
 // ── 履歴（賢者ごとの最新対話） ────────────────────────────────────────────────
 async function renderHistory() {
+  if (!state.user?.logged_in) { renderLoginGate("ログインして対話の記録を見る"); return; }
   app.innerHTML = `
     <section class="hero-list">
       <p class="eyebrow">Recent Dialogues</p>
@@ -1087,8 +1103,11 @@ async function renderHistory() {
     <section id="historyList" class="history-list"></section>
   `;
   const list = document.querySelector("#historyList");
+  const owner = identityKey(), epoch = state.identityEpoch;
+  const current = () => epoch === state.identityEpoch && owner === identityKey() && document.querySelector("#historyList") === list;
   try {
     const all = await apiService.getHistory();
+    if (!current()) return;
     state.history = all;
 
     // 賢者ごとに最新1件を抽出
@@ -1106,6 +1125,7 @@ async function renderHistory() {
       ? latest.map(renderHistoryItem).join("")
       : `<div class="empty">まだ対話の記録はありません。</div>`;
   } catch {
+    if (!current()) return;
     list.innerHTML = `<div class="empty">記録を読み込めませんでした。</div>`;
   }
 }
@@ -1117,7 +1137,7 @@ function renderHistoryItem(item) {
   return `
     <article class="history-item theme-${sage.theme}">
       <div class="history-item-inner">
-        <img class="history-sage-icon" src="${sage.portrait}" alt="${escapeHtml(sage.name)}" onerror="this.style.display='none'">
+        <img class="history-sage-icon" src="${sage.portraitIcon || sage.portrait}" alt="${escapeHtml(sage.name)}" width="${sage.portraitIconWidth || 128}" height="${sage.portraitIconHeight || 128}" loading="lazy" decoding="async" onerror="this.style.display='none'">
         <div>
           <p class="eyebrow">${dateStr}</p>
           <h2>${sage.name}</h2>
@@ -1130,10 +1150,15 @@ function renderHistoryItem(item) {
 }
 
 // ── アバターレンダリング ──────────────────────────────────────────────────────
-function renderAvatar(sage, size) {
+function renderAvatar(sage, size, eager = false) {
   const symbol = sage.allowPortrait ? (sage.displayName || sage.name).slice(0, 2) : "☾";
+  const isBust = size === "bust";
+  const sizes = size === "profile" ? "(max-width: 700px) 85vw, 420px" : "(max-width: 600px) 94vw, (max-width: 1000px) 45vw, 320px";
   return `
-    <img src="${sage.portrait}" alt="${sage.allowPortrait ? sage.name : `${sage.name}の象徴表現`}" onerror="this.classList.add('missing')">
+    <img src="${isBust ? (sage.portraitIcon || sage.portrait) : sage.portrait}" ${!isBust && sage.portraitSrcSet ? `srcset="${sage.portraitSrcSet}" sizes="${sizes}"` : ""}
+      width="${isBust ? (sage.portraitIconWidth || 128) : (sage.portraitWidth || 320)}" height="${isBust ? (sage.portraitIconHeight || 128) : (sage.portraitHeight || 320)}"
+      loading="${eager || size !== "card" ? "eager" : "lazy"}" ${eager ? 'fetchpriority="high"' : ""} decoding="async"
+      alt="${sage.allowPortrait ? sage.name : `${sage.name}の象徴表現`}" onerror="this.classList.add('missing')">
     <div class="avatar-symbol avatar-${size}">${symbol}</div>
     <div class="avatar-motif" aria-hidden="true">${motifSvg(sage.motif)}</div>
   `;
@@ -1157,20 +1182,6 @@ function motifSvg(motif) {
     geometry:      `<svg viewBox="0 0 90 90"><path d="M45 10l30 18v34L45 80 15 62V28z" fill="none"/><path d="M45 10v70M15 28l60 34M75 28L15 62M30 19l30 52M60 19L30 71" fill="none"/></svg>`,
   };
   return motifs[motif] || motifs.greek;
-}
-
-// ── 決済成功バナー ─────────────────────────────────────────────────────────────
-function showSuccessBanner() {
-  const banner = document.getElementById("successBanner");
-  if (banner) {
-    banner.hidden = false;
-    setTimeout(() => banner.hidden = true, 8000);
-  }
-}
-
-function hideSuccessBanner() {
-  const banner = document.getElementById("successBanner");
-  if (banner) banner.hidden = true;
 }
 
 // ── ユーティリティ ─────────────────────────────────────────────────────────────
